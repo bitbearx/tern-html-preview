@@ -8,25 +8,23 @@ function context.is_html(path)
     return lower:sub(-5) == ".html" or lower:sub(-4) == ".htm"
 end
 
--- 按真实主机元信息识别本地文件，避免同名远程路径误读本机磁盘。
-function context.is_local(cx, name)
+-- 使用宿主提供的主机身份，不把远端路径当作本机路径校验。
+function context.host(cx, name)
     for _, host in cx.hosts:list() do
-        if host.kind == "local" and host.name == name then return true end
+        if host.name == name then return host end
     end
-    return false
+    return nil
 end
 
--- 只为当前本地 HTML 源码面板提供命令，不扫描或读取源码正文。
+-- 当前 HTML 源码同时携带主机和面板身份，供本地直读或远程快照分流。
 function context.current_source(cx)
     local focused = cx.session:focused()
     if not focused then return nil end
     local pane = cx.session:pane(focused)
     if not pane or pane.kind ~= "file" or not context.is_html(pane.path) then return nil end
     for _, host in cx.hosts:list() do
-        if host.kind == "local" then
-            for _, id in host.panes do
-                if id == focused then return pane.path end
-            end
+        for _, id in host.panes do
+            if id == focused then return { path = pane.path, host = host, pane = focused } end
         end
     end
     return nil

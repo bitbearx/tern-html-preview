@@ -19,8 +19,8 @@ COMMAND = "HTML Preview: 预览当前 HTML"
 
 
 @unittest.skipUnless(TERN and os.environ.get("HTML_PREVIEW_UI_TEST") == "1", "需要 Tern 和 HTML_PREVIEW_UI_TEST=1；会打开隔离窗口")
-class PreviewTest(unittest.TestCase):
-    """只操作测试自己的配置、文件、窗口和守护进程。"""
+class TernWindowTest(unittest.TestCase):
+    """共享隔离窗口夹具，只操作测试自己的配置、文件和守护进程。"""
 
     @classmethod
     def setUpClass(cls):
@@ -105,10 +105,10 @@ class PreviewTest(unittest.TestCase):
         if isinstance(value, dict):
             yield value
             for child in value.values():
-                yield from PreviewTest.nodes(child)
+                yield from TernWindowTest.nodes(child)
         elif isinstance(value, list):
             for child in value:
-                yield from PreviewTest.nodes(child)
+                yield from TernWindowTest.nodes(child)
 
     def texts(self):
         """读取可见控件文字，不从插件内部变量构造预期结果。"""
@@ -136,6 +136,21 @@ class PreviewTest(unittest.TestCase):
     def webcall(self, operation):
         """控制命令直接接收 JSON，不能套用 scenario 的二次引号。"""
         return self.ctl("webcall", ".kit-web-page", json.dumps(operation))
+
+    def lua(self, code):
+        """在隔离窗口调用真实 SDK；只返回状态，不把大源码经过工具输出截断。"""
+        self.ctl("carly", "lua", json.dumps(code, ensure_ascii=False))
+        result = self.ctl("state")["carly"]["last_tool"]
+        self.assertFalse(result.get("error"), result.get("text"))
+        return result
+
+    def focused_webcall(self, operation):
+        """多主机场景只操作当前聚焦的浏览器，不误读另一主机的页面。"""
+        return self.ctl("webcall", ".tn-pane.on .kit-web-page", json.dumps(operation))
+
+
+class PreviewTest(TernWindowTest):
+    """验证本地文件预览继续保留原有语义。"""
 
     def test_manual_preview_and_normalized_url_reuse(self):
         """验证显式触发、真实资源与交互，以及 WebKit 规范化 URL 后仍复用面板。"""
@@ -187,6 +202,77 @@ class PreviewTest(unittest.TestCase):
         self.assertNotIn(COMMAND, "".join(self.texts()))
         self.ctl("key", "Escape")
         type(self).capture = self.webcall({"op": "capture"})
+
+
+class RemotePreviewTest(TernWindowTest):
+    """Loopback 验证远程入口与快照生命周期，不证明真实远程文件来源正确。"""
+
+    def open_remote_source(self, host, path, slot):
+        """通过宿主文件入口打开指定远程文件，避免 docs:open 切回本机。"""
+        self.ctl("remote", "switch", host)
+        self.lua('cx:open(' + json.dumps(str(path) + ':1', ensure_ascii=False) + ', "beside")')
+        self.until(lambda: self.ctl("file", "wait"))
+        self.lua(slot + ' = cx.session:focused()')
+        self.ctl("files", "follow")
+        self.ctl("files", "wait")
+        self.assertNotEqual(self.ctl("state")["files"]["host"], 0)
+        self.ctl("files", "select", path.name)
+
+    def test_complete_snapshot_refresh_host_isolation_and_cleanup(self):
+        """完整保留长行源码，不同步资源，重复预览更新，跨主机隔离且关闭后回收。"""
+        source = self.workspace / "inline.html"
+        html = ('<!doctype html><meta charset="gbk"><style>h1{color:rgb(12,100,150)}</style>'
+                '<h1>远程源码快照</h1><p id="version">FIRST</p><script>const payload="' + 'a' * 2_000_000 +
+                '";window.payloadLength=payload.length;</script><script src="app.js"></script>' +
+                '\n<!-- additional source line -->' * 2501 + '<p id="tail">SOURCE_END</p>')
+        source.write_text(html, encoding="utf-8")
+        (self.workspace / "app.js").write_text('window.externalLoaded=true;', encoding="utf-8")
+        self.ctl("remote", "loopback", "tester@snapshot-a")
+        self.open_remote_source("snapshot-a", source, "source_a")
+        self.click_preview()
+        self.until(lambda: self.focused_webcall({"op": "eval", "function": "() => document.querySelector('#tail')?.textContent === 'SOURCE_END'"}).get("value"))
+        actual = self.focused_webcall({"op": "eval", "function": "() => ({title:document.querySelector('h1').textContent,css:getComputedStyle(document.querySelector('h1')).color,payload:window.payloadLength,external:window.externalLoaded===true})"})["value"]
+        self.assertEqual(actual, {"title": "远程源码快照", "css": "rgb(12, 100, 150)", "payload": 2_000_000, "external": False})
+        cache = self.root / "config/plugin-data/html-preview/snapshots"
+        first = next(cache.rglob("index.html"))
+        self.assertEqual(first.read_text(encoding="utf-8-sig"), html)
+        self.lua('preview_a = cx.session:focused()')
+
+        changed = html.replace('id="version">FIRST', 'id="version">SECOND')
+        source.write_text(changed, encoding="utf-8")
+        self.lua('cx.layout:focus(source_a)')
+        self.ctl("files", "follow")
+        self.ctl("files", "wait")
+        self.ctl("files", "select", source.name)
+        self.click_preview()
+        self.until(lambda: self.focused_webcall({"op": "eval", "function": "() => document.querySelector('#version')?.textContent === 'SECOND'"}).get("value"))
+        self.assertEqual(list(cache.rglob("index.html")), [first])
+        self.assertEqual(first.read_text(encoding="utf-8-sig"), changed)
+        self.lua('assert(cx.session:focused() == preview_a, "重复预览不应新增面板")')
+
+        # 同一物理文件用于两个真正的 loopback 主机入口，验证来源身份不会合并。
+        self.ctl("remote", "loopback", "tester@snapshot-b")
+        self.open_remote_source("snapshot-b", source, "source_b")
+        self.ctl("palette", "HTML Preview")
+        self.ctl("key", "Enter")
+        second = self.until(lambda: next((path for path in cache.rglob("index.html") if path != first), None))
+        self.until(lambda: self.focused_webcall({"op": "eval", "function": "() => location.href"}).get("value") == second.resolve().as_uri())
+        self.until(lambda: self.focused_webcall({"op": "eval", "function": "() => document.querySelector('#version')?.textContent === 'SECOND'"}).get("value"))
+        self.assertEqual(second.read_text(encoding="utf-8-sig"), changed)
+        self.lua('preview_b = cx.session:focused(); assert(preview_b ~= preview_a, "不同主机不应共用预览面板")')
+        type(self).capture = self.focused_webcall({"op": "capture"})
+
+        self.lua('cx.layout:focus(preview_a)')
+        self.ctl("close")
+        self.until(lambda: not first.exists())
+        self.assertTrue(second.exists())
+        self.lua('cx.layout:focus(preview_b)')
+        # 重载后没有旧 VM 的缓存记录，仍应通过活动 URL 保留和回收快照。
+        self.ctl("plugins", "run", "reload_plugins")
+        self.ctl("wait", "300")
+        self.assertTrue(second.exists())
+        self.ctl("close")
+        self.until(lambda: not second.exists())
 
 
 if __name__ == "__main__":
