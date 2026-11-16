@@ -1,0 +1,7 @@
+schema = 1
+id = "html-preview"
+name = "HTML Preview"
+version = "0.1.0"
+description = "Preview saved local HTML files in Tern's built-in browser."
+icon = "globe"
+window = "window.luau"
